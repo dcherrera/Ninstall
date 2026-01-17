@@ -47,7 +47,7 @@ echo "You'll need:"
 echo "  - The IP address of an existing swarm manager"
 echo "  - The manager join token (from bootstrap.sh output)"
 echo ""
-read -p "Press Enter to continue (or Ctrl+C to cancel)..."
+read -p "Press Enter to continue (or Ctrl+C to cancel)..." </dev/tty
 
 # ============================================================
 # Step 1: Check/Install Docker
@@ -97,7 +97,7 @@ if docker info 2>/dev/null | grep -q "Swarm: active"; then
         log "This node is a swarm manager."
         docker node ls
         echo ""
-        read -p "Continue anyway? This will NOT re-join the swarm. [y/N]: " CONTINUE
+        read -p "Continue anyway? This will NOT re-join the swarm. [y/N]: " CONTINUE </dev/tty
         if [[ ! $CONTINUE =~ ^[Yy]$ ]]; then
             exit 0
         fi
@@ -124,10 +124,10 @@ echo ""
 
 # Suggest next node number
 if [ "$CURRENT_HOSTNAME" = "localhost" ] || [[ "$CURRENT_HOSTNAME" =~ ^ubuntu ]]; then
-    read -p "Enter hostname for this node [node-2]: " NEW_HOSTNAME
+    read -p "Enter hostname for this node [node-2]: " NEW_HOSTNAME </dev/tty
     NEW_HOSTNAME=${NEW_HOSTNAME:-node-2}
 else
-    read -p "Enter hostname for this node [$CURRENT_HOSTNAME]: " NEW_HOSTNAME
+    read -p "Enter hostname for this node [$CURRENT_HOSTNAME]: " NEW_HOSTNAME </dev/tty
     NEW_HOSTNAME=${NEW_HOSTNAME:-$CURRENT_HOSTNAME}
 fi
 
@@ -156,13 +156,13 @@ else
     echo "This will show you a Manager IP and a short 6-character Pairing Code."
     echo ""
 
-    read -p "Manager IP address: " MANAGER_IP
+    read -p "Manager IP address: " MANAGER_IP </dev/tty
     if [ -z "$MANAGER_IP" ]; then
         error "Manager IP is required."
     fi
 
     echo ""
-    read -p "Pairing code (6 characters): " PAIR_CODE
+    read -p "Pairing code (6 characters): " PAIR_CODE </dev/tty
     if [ -z "$PAIR_CODE" ]; then
         error "Pairing code is required."
     fi
@@ -177,7 +177,7 @@ else
         echo "Make sure you ran ./pair.sh on the manager first."
         echo ""
         echo "Or enter the full token manually:"
-        read -p "Manager join token: " MANAGER_TOKEN
+        read -p "Manager join token: " MANAGER_TOKEN </dev/tty
         if [ -z "$MANAGER_TOKEN" ]; then
             error "Manager token is required."
         fi
