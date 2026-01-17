@@ -146,8 +146,8 @@ header "Step 4: Join Swarm"
 if [ "$ALREADY_IN_SWARM" = true ]; then
     log "Already in swarm, skipping join..."
 else
-    echo "Enter the swarm manager details from your first node."
-    echo "(You can find these in /opt/nodenook/config/swarm.env on the first node)"
+    echo "On the existing swarm manager, run: ./pair.sh"
+    echo "This will show you a Manager IP and a short 6-character Pairing Code."
     echo ""
 
     read -p "Manager IP address: " MANAGER_IP
@@ -156,9 +156,25 @@ else
     fi
 
     echo ""
-    read -p "Manager join token: " MANAGER_TOKEN
+    read -p "Pairing code (6 characters): " PAIR_CODE
+    if [ -z "$PAIR_CODE" ]; then
+        error "Pairing code is required."
+    fi
+
+    # Fetch the token from the pairing server
+    log "Fetching join token from manager..."
+    MANAGER_TOKEN=$(curl -sf "http://$MANAGER_IP:9876/" 2>/dev/null)
+
     if [ -z "$MANAGER_TOKEN" ]; then
-        error "Manager token is required."
+        echo ""
+        warn "Could not fetch token from pairing server."
+        echo "Make sure you ran ./pair.sh on the manager first."
+        echo ""
+        echo "Or enter the full token manually:"
+        read -p "Manager join token: " MANAGER_TOKEN
+        if [ -z "$MANAGER_TOKEN" ]; then
+            error "Manager token is required."
+        fi
     fi
 
     echo ""
