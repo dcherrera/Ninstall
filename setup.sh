@@ -41,6 +41,7 @@ echo "  1. Install Docker (if not present)"
 echo "  2. Set the hostname"
 echo "  3. Join the Docker Swarm as a manager"
 echo "  4. Set up SSH access for the dashboard"
+echo "  5. Configure shelf mode (no sleep, lid close ignored)"
 echo ""
 echo "You'll need:"
 echo "  - The IP address of an existing swarm manager"
@@ -250,9 +251,37 @@ echo "  cat /opt/nodenook/config/dashboard_key.pub"
 echo "  # Then add that to this node's ~/.ssh/authorized_keys"
 
 # ============================================================
-# Step 7: Verify
+# Step 7: Configure Shelf Mode (no sleep)
 # ============================================================
-header "Step 7: Verification"
+header "Step 7: Shelf Mode"
+
+log "Configuring system to never sleep (shelf mode)..."
+
+# Disable sleep and suspend targets
+sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+
+# Configure logind to ignore lid close and idle
+sudo mkdir -p /etc/systemd/logind.conf.d
+sudo tee /etc/systemd/logind.conf.d/shelf-mode.conf > /dev/null << SHELFCONF
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+IdleAction=ignore
+SHELFCONF
+
+# Restart logind to apply
+sudo systemctl restart systemd-logind
+
+success "Shelf mode configured!"
+echo "  - System will never sleep or suspend"
+echo "  - Lid close is ignored"
+echo "  - Screen will dim but system stays awake"
+
+# ============================================================
+# Step 8: Verify
+# ============================================================
+header "Step 8: Verification"
 
 log "Checking swarm nodes..."
 docker node ls
@@ -270,7 +299,7 @@ docker node inspect self --format '{{.Description.Hostname}} - {{.Status.State}}
 # ============================================================
 header "Setup Complete!"
 
-success "This node has joined the NodeNook cluster!"
+success "This node has joined the NodeNook cluster (shelf mode enabled)!"
 echo ""
 echo "┌─────────────────────────────────────────────────────────────┐"
 echo "│  Node Information                                          │"
