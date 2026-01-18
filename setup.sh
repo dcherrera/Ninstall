@@ -67,13 +67,7 @@ if ! groups | grep -q docker; then
     log "Adding $USER to docker group..."
     sudo usermod -aG docker $USER
     log "Refreshing group membership..."
-    # Re-run script with docker group (handle both file and curl|bash cases)
-    SCRIPT_URL="https://raw.githubusercontent.com/dcherrera/Ninstall/main/setup.sh"
-    if [ -f "$0" ] && [ "$0" != "bash" ] && [ "$0" != "-bash" ]; then
-        exec sg docker -c "$0 $*"
-    else
-        exec sg docker -c "curl -sSL $SCRIPT_URL | bash"
-    fi
+    exec sg docker -c "$0 $*"
 fi
 
 # Enable Docker on boot
