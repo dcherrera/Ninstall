@@ -168,13 +168,30 @@ else
     if [ -z "$MANAGER_TOKEN" ]; then
         echo ""
         warn "Could not fetch token from pairing server."
-        echo "Make sure you ran ./pair.sh on the manager first."
+        echo "Make sure the Add Node dialog is open in NodeNook."
         echo ""
         echo "Or enter the full token manually:"
         read -p "Manager join token: " MANAGER_TOKEN </dev/tty
         if [ -z "$MANAGER_TOKEN" ]; then
             error "Manager token is required."
         fi
+    fi
+
+    # Fetch SSH keys from pairing server
+    log "Fetching SSH keys..."
+    SSH_KEYS=$(curl -sf "http://$MANAGER_IP:9876/keys" 2>/dev/null)
+    if [ -n "$SSH_KEYS" ]; then
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+        touch ~/.ssh/authorized_keys
+        chmod 600 ~/.ssh/authorized_keys
+        # Add keys if not already present
+        while IFS= read -r key; do
+            if [ -n "$key" ] && ! grep -qF "$key" ~/.ssh/authorized_keys 2>/dev/null; then
+                echo "$key" >> ~/.ssh/authorized_keys
+            fi
+        done <<< "$SSH_KEYS"
+        success "SSH keys added!"
     fi
 
     echo ""
@@ -233,21 +250,7 @@ else
     log "SSH server is already available."
 fi
 
-# Set up authorized_keys if not already present
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-touch ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
-
-success "SSH is ready for dashboard access."
-echo ""
-echo "To enable passwordless access from your Mac, add your SSH public key:"
-echo "  ssh-copy-id $USER@$NODE_IP"
-echo ""
-echo "Or copy the key from the first node:"
-echo "  # On the first node:"
-echo "  cat /opt/nodenook/config/dashboard_key.pub"
-echo "  # Then add that to this node's ~/.ssh/authorized_keys"
+success "SSH keys were added during pairing - dashboard can now connect!"
 
 # ============================================================
 # Step 7: Configure Shelf Mode (no sleep)
