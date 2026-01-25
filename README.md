@@ -24,3 +24,7 @@ curl -sSL https://raw.githubusercontent.com/dcherrera/Ninstall/main/bootstrap.sh
 ### setup.sh (coming soon)
 
 Joins additional nodes to an existing swarm using secure pairing codes.
+
+## License
+
+[MIT Transparency License](LICENSE)
