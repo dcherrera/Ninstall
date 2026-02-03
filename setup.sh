@@ -38,14 +38,16 @@ echo "This script will add this machine to an existing NodeNook cluster."
 echo ""
 echo "It will:"
 echo "  1. Install Docker (if not present)"
-echo "  2. Set the hostname"
-echo "  3. Join the Docker Swarm as a manager"
-echo "  4. Set up SSH access for the dashboard"
-echo "  5. Configure shelf mode (no sleep, lid close ignored)"
+echo "  2. Install Avahi for mDNS discovery (hostname.local)"
+echo "  3. Set the hostname"
+echo "  4. Join the Docker Swarm as a manager"
+echo "  5. Set up SSH access for the dashboard"
+echo "  6. Install auto-recovery service (self-healing after reboot/IP change)"
+echo "  7. Configure shelf mode (no sleep, lid close ignored)"
 echo ""
 echo "You'll need:"
 echo "  - The IP address of an existing swarm manager"
-echo "  - The manager join token (from bootstrap.sh output)"
+echo "  - The pairing code (from NodeNook app)"
 echo ""
 read -p "Press Enter to continue (or Ctrl+C to cancel)..." </dev/tty
 
@@ -79,6 +81,39 @@ if ! docker info &> /dev/null; then
 fi
 
 success "Docker is ready!"
+
+# ============================================================
+# Step 1b: Install Avahi (mDNS for hostname discovery)
+# ============================================================
+header "Step 1b: mDNS Discovery"
+
+log "Installing Avahi for hostname-based discovery..."
+
+if command -v apt-get &> /dev/null; then
+    sudo apt-get update -qq
+    sudo apt-get install -y avahi-daemon avahi-utils libnss-mdns
+elif command -v dnf &> /dev/null; then
+    sudo dnf install -y avahi nss-mdns avahi-tools
+elif command -v yum &> /dev/null; then
+    sudo yum install -y avahi nss-mdns avahi-tools
+else
+    warn "Could not install Avahi automatically. mDNS discovery may not work."
+fi
+
+# Enable and start avahi
+sudo systemctl enable avahi-daemon 2>/dev/null || true
+sudo systemctl start avahi-daemon 2>/dev/null || true
+
+# Ensure nsswitch.conf includes mdns for hostname resolution
+if [ -f /etc/nsswitch.conf ]; then
+    if ! grep -q "mdns" /etc/nsswitch.conf; then
+        log "Configuring nsswitch for mDNS..."
+        sudo sed -i 's/^hosts:.*/hosts: files mdns_minimal [NOTFOUND=return] dns/' /etc/nsswitch.conf
+    fi
+fi
+
+success "mDNS discovery enabled!"
+log "This node will be discoverable as: ${NEW_HOSTNAME:-$(hostname)}.local"
 
 # ============================================================
 # Step 2: Check if already in a swarm
@@ -201,12 +236,14 @@ else
 fi
 
 # ============================================================
-# Step 5: Create NodeNook directories
+# Step 5: Create NodeNook directories and Auto-Recovery
 # ============================================================
-header "Step 5: Configuration"
+header "Step 5: Configuration & Auto-Recovery"
 
 log "Creating NodeNook directories..."
 sudo mkdir -p "$NODENOOK_CONFIG"
+sudo mkdir -p "$NODENOOK_DIR/bin"
+sudo mkdir -p "$NODENOOK_DIR/logs"
 sudo chown -R $USER:$USER "$NODENOOK_DIR"
 
 # Save local node info
@@ -222,6 +259,301 @@ EOF
 
 chmod 600 "$NODENOOK_CONFIG/node.env"
 success "Node configuration saved to $NODENOOK_CONFIG/node.env"
+
+# ============================================================
+# Step 5b: Setup cluster.env (fetch from manager or create)
+# ============================================================
+log "Setting up cluster configuration..."
+
+# Try to fetch existing cluster.env from manager
+CLUSTER_ENV_FETCHED=false
+if [ -n "$MANAGER_IP" ]; then
+    EXISTING_CLUSTER_ENV=$(ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+        "$USER@$MANAGER_IP" "cat $NODENOOK_CONFIG/cluster.env 2>/dev/null" 2>/dev/null || true)
+
+    if [ -n "$EXISTING_CLUSTER_ENV" ]; then
+        echo "$EXISTING_CLUSTER_ENV" > "$NODENOOK_CONFIG/cluster.env"
+        CLUSTER_ENV_FETCHED=true
+        log "Fetched cluster configuration from manager"
+    fi
+fi
+
+# Create or update cluster.env
+if [ "$CLUSTER_ENV_FETCHED" = true ]; then
+    # Add this node to CLUSTER_HOSTNAMES if not already present
+    source "$NODENOOK_CONFIG/cluster.env"
+    if ! echo "$CLUSTER_HOSTNAMES" | grep -qw "$NEW_HOSTNAME"; then
+        CLUSTER_HOSTNAMES="$CLUSTER_HOSTNAMES $NEW_HOSTNAME"
+        sed -i "s/^CLUSTER_HOSTNAMES=.*/CLUSTER_HOSTNAMES=\"$CLUSTER_HOSTNAMES\"/" "$NODENOOK_CONFIG/cluster.env"
+        log "Added $NEW_HOSTNAME to cluster hostnames"
+    fi
+else
+    # Create new cluster.env (this is first node or couldn't fetch)
+    cat > "$NODENOOK_CONFIG/cluster.env" << EOF
+# NodeNook Cluster Configuration
+# All node hostnames (whitelist for auto-recovery)
+# Generated: $(date)
+
+CLUSTER_HOSTNAMES="$NEW_HOSTNAME"
+CLUSTER_USER="$USER"
+EOF
+    log "Created new cluster configuration"
+fi
+
+chmod 600 "$NODENOOK_CONFIG/cluster.env"
+
+# ============================================================
+# Step 5c: Install Auto-Recovery Script
+# ============================================================
+log "Installing auto-recovery script..."
+
+sudo tee "$NODENOOK_DIR/bin/swarm-recovery.sh" > /dev/null << 'RECOVERY_SCRIPT'
+#!/bin/bash
+#
+# NodeNook Swarm Auto-Recovery Script
+# Self-healing with dynamic leader election (lowest hostname = leader)
+#
+
+set -e
+
+CONFIG_DIR="/opt/nodenook/config"
+LOG_DIR="/opt/nodenook/logs"
+LOG="$LOG_DIR/recovery.log"
+
+# Ensure log directory exists
+mkdir -p "$LOG_DIR"
+
+# Load cluster configuration
+if [ ! -f "$CONFIG_DIR/cluster.env" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: cluster.env not found" >> "$LOG"
+    exit 1
+fi
+source "$CONFIG_DIR/cluster.env"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"
+}
+
+log_error() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" | tee -a "$LOG" >&2
+}
+
+# Get current hostname
+MY_HOSTNAME=$(hostname)
+
+# Discover online nodes via mDNS + SSH verification (security: only trust SSH-accessible nodes)
+discover_online_nodes() {
+    local online=""
+    for host in $CLUSTER_HOSTNAMES; do
+        # Try to resolve via mDNS
+        local ip=""
+        ip=$(avahi-resolve -n "${host}.local" 2>/dev/null | awk '{print $2}')
+
+        # Fallback to regular DNS if mDNS fails
+        if [ -z "$ip" ]; then
+            ip=$(getent hosts "${host}.local" 2>/dev/null | awk '{print $1}')
+        fi
+        if [ -z "$ip" ]; then
+            ip=$(getent hosts "$host" 2>/dev/null | awk '{print $1}')
+        fi
+
+        [ -z "$ip" ] && continue
+
+        # Verify SSH access (security: proves it's a real cluster node with our keys)
+        if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+            "$CLUSTER_USER@${host}.local" "true" 2>/dev/null; then
+            online="$online $host"
+        elif ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+            "$CLUSTER_USER@$ip" "true" 2>/dev/null; then
+            online="$online $host"
+        fi
+    done
+    # Sort alphabetically and return
+    echo $online | tr ' ' '\n' | sort | tr '\n' ' ' | xargs
+}
+
+# Am I the recovery leader? (lowest alphabetical hostname among online nodes)
+am_i_leader() {
+    local online_sorted="$1"
+    local first=$(echo $online_sorted | awk '{print $1}')
+    [ "$first" = "$MY_HOSTNAME" ]
+}
+
+# Try to rejoin an existing healthy swarm
+try_rejoin() {
+    for host in $CLUSTER_HOSTNAMES; do
+        [ "$host" = "$MY_HOSTNAME" ] && continue
+
+        # Resolve hostname
+        local ip=""
+        ip=$(avahi-resolve -n "${host}.local" 2>/dev/null | awk '{print $2}')
+        if [ -z "$ip" ]; then
+            ip=$(getent hosts "${host}.local" 2>/dev/null | awk '{print $1}')
+        fi
+        [ -z "$ip" ] && continue
+
+        # Try to get fresh token via SSH (secure: encrypted channel)
+        local token=""
+        token=$(ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+            "$CLUSTER_USER@${host}.local" "docker swarm join-token manager -q 2>/dev/null" 2>/dev/null || true)
+
+        if [ -n "$token" ] && [[ "$token" == SWMTKN-* ]]; then
+            log "Got token from $host, attempting to join..."
+            docker swarm leave --force 2>/dev/null || true
+            sleep 2
+            if docker swarm join --token "$token" "${ip}:2377" 2>/dev/null; then
+                log "Successfully rejoined swarm via $host ($ip)"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+# Cache tokens for quick recovery (stored securely with restricted permissions)
+cache_tokens() {
+    docker swarm join-token manager -q > "$CONFIG_DIR/manager.token" 2>/dev/null || true
+    docker swarm join-token worker -q > "$CONFIG_DIR/worker.token" 2>/dev/null || true
+    chmod 600 "$CONFIG_DIR"/*.token 2>/dev/null || true
+}
+
+# Main recovery logic
+main() {
+    log "=========================================="
+    log "NodeNook Auto-Recovery Starting"
+    log "Hostname: $MY_HOSTNAME"
+    log "Cluster nodes: $CLUSTER_HOSTNAMES"
+    log "=========================================="
+
+    # Check if swarm is already healthy
+    if docker node ls &>/dev/null 2>&1; then
+        log "Swarm is healthy, caching tokens and exiting"
+        cache_tokens
+        exit 0
+    fi
+
+    log "Swarm is unhealthy or not active, starting recovery..."
+
+    # Wait for network to fully initialize
+    log "Waiting for network..."
+    sleep 10
+
+    # Discovery phase - find all online nodes
+    local online=$(discover_online_nodes)
+    local online_count=$(echo $online | wc -w)
+    log "Online nodes ($online_count): $online"
+
+    if [ $online_count -eq 0 ]; then
+        log "No other nodes reachable. Waiting and retrying..."
+        sleep 30
+        online=$(discover_online_nodes)
+        online_count=$(echo $online | wc -w)
+        log "Retry - Online nodes ($online_count): $online"
+    fi
+
+    # Try to rejoin first (maybe another node already recovered the cluster)
+    log "Attempting to rejoin existing cluster..."
+    if try_rejoin; then
+        cache_tokens
+        exit 0
+    fi
+
+    # Leader election based on alphabetical hostname order
+    if am_i_leader "$online"; then
+        log "I am recovery leader (lowest hostname among online nodes)"
+        log "Waiting 90s to allow other nodes to come online..."
+        sleep 90
+
+        # Rediscover after waiting
+        online=$(discover_online_nodes)
+        log "After wait - Online nodes: $online"
+
+        # Try rejoin again (maybe cluster recovered while we waited)
+        if try_rejoin; then
+            cache_tokens
+            exit 0
+        fi
+
+        # Force new cluster as last resort
+        log "All recovery attempts failed. Forcing new cluster..."
+        docker swarm leave --force 2>/dev/null || true
+        sleep 2
+
+        local my_ip=$(hostname -I | awk '{print $1}')
+        if docker swarm init --advertise-addr "$my_ip"; then
+            log "New cluster created with advertise address: $my_ip"
+            cache_tokens
+
+            # Notify other nodes to retry recovery
+            log "Notifying other nodes to rejoin..."
+            for host in $CLUSTER_HOSTNAMES; do
+                [ "$host" = "$MY_HOSTNAME" ] && continue
+                ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                    "$CLUSTER_USER@${host}.local" \
+                    "sudo systemctl restart nodenook-recovery 2>/dev/null" &
+            done
+            wait
+
+            log "Recovery complete - new cluster created"
+            exit 0
+        else
+            log_error "Failed to initialize new swarm"
+            exit 1
+        fi
+    else
+        log "Not the leader, waiting for leader to recover cluster..."
+
+        # Retry loop - wait for leader to create cluster, then join
+        for i in $(seq 1 12); do
+            sleep 30
+            log "Retry $i/12 - attempting to rejoin..."
+            if try_rejoin; then
+                cache_tokens
+                log "Successfully rejoined on retry $i"
+                exit 0
+            fi
+        done
+
+        log_error "Max retries exceeded, recovery failed. Manual intervention needed."
+        exit 1
+    fi
+}
+
+main "$@"
+RECOVERY_SCRIPT
+
+sudo chmod 700 "$NODENOOK_DIR/bin/swarm-recovery.sh"
+sudo chown root:root "$NODENOOK_DIR/bin/swarm-recovery.sh"
+success "Auto-recovery script installed"
+
+# ============================================================
+# Step 5d: Install Systemd Service
+# ============================================================
+log "Installing auto-recovery systemd service..."
+
+sudo tee /etc/systemd/system/nodenook-recovery.service > /dev/null << 'SYSTEMD_SERVICE'
+[Unit]
+Description=NodeNook Swarm Auto-Recovery
+Documentation=https://github.com/dcherrera/Ninstall
+After=network-online.target docker.service avahi-daemon.service
+Wants=network-online.target docker.service avahi-daemon.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sleep 5
+ExecStart=/opt/nodenook/bin/swarm-recovery.sh
+TimeoutStartSec=600
+StandardOutput=append:/opt/nodenook/logs/recovery.log
+StandardError=append:/opt/nodenook/logs/recovery.log
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD_SERVICE
+
+sudo systemctl daemon-reload
+sudo systemctl enable nodenook-recovery.service
+success "Auto-recovery service enabled (will run on boot)"
 
 # ============================================================
 # Step 6: Set up SSH access
@@ -251,6 +583,46 @@ else
 fi
 
 success "SSH keys were added during pairing - dashboard can now connect!"
+
+# ============================================================
+# Step 6b: Exchange SSH Host Keys with Cluster Nodes
+# ============================================================
+log "Setting up SSH host key trust with cluster nodes..."
+
+# Store host keys for known cluster nodes (prevents MITM warnings during recovery)
+source "$NODENOOK_CONFIG/cluster.env" 2>/dev/null || true
+
+if [ -n "$CLUSTER_HOSTNAMES" ]; then
+    for host in $CLUSTER_HOSTNAMES; do
+        [ "$host" = "$NEW_HOSTNAME" ] && continue
+        ssh-keyscan -H "${host}.local" >> ~/.ssh/known_hosts 2>/dev/null || true
+        if [ -n "$MANAGER_IP" ]; then
+            ssh-keyscan -H "$MANAGER_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
+        fi
+    done
+    log "Added known cluster host keys"
+fi
+
+# ============================================================
+# Step 6c: Sync Cluster Config to Other Nodes
+# ============================================================
+log "Syncing cluster configuration to other nodes..."
+
+source "$NODENOOK_CONFIG/cluster.env" 2>/dev/null || true
+
+SYNC_COUNT=0
+for host in $CLUSTER_HOSTNAMES; do
+    [ "$host" = "$NEW_HOSTNAME" ] && continue
+    if scp -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+        "$NODENOOK_CONFIG/cluster.env" "$USER@${host}.local:$NODENOOK_CONFIG/cluster.env" 2>/dev/null; then
+        log "  Synced to $host"
+        SYNC_COUNT=$((SYNC_COUNT + 1))
+    fi
+done
+
+if [ $SYNC_COUNT -gt 0 ]; then
+    success "Cluster config synced to $SYNC_COUNT node(s)"
+fi
 
 # ============================================================
 # Step 7: Configure Shelf Mode (no sleep)
@@ -301,29 +673,38 @@ docker node inspect self --format '{{.Description.Hostname}} - {{.Status.State}}
 # ============================================================
 header "Setup Complete!"
 
-success "This node has joined the NodeNook cluster (shelf mode enabled)!"
+success "This node has joined the NodeNook cluster!"
 echo ""
 echo "┌─────────────────────────────────────────────────────────────┐"
 echo "│  Node Information                                          │"
 echo "├─────────────────────────────────────────────────────────────┤"
 echo "│                                                             │"
-echo "│  Hostname: $NEW_HOSTNAME"
-echo "│  IP:       $NODE_IP"
-echo "│  Role:     Manager"
+echo "│  Hostname:     $NEW_HOSTNAME"
+echo "│  IP:           $NODE_IP"
+echo "│  mDNS:         ${NEW_HOSTNAME}.local"
+echo "│  Role:         Manager"
 echo "│                                                             │"
-echo "│  Config:   $NODENOOK_CONFIG/node.env                       │"
+echo "│  Config:       $NODENOOK_CONFIG/"
+echo "│  Recovery:     $NODENOOK_DIR/bin/swarm-recovery.sh"
+echo "│  Logs:         $NODENOOK_DIR/logs/recovery.log"
 echo "│                                                             │"
 echo "└─────────────────────────────────────────────────────────────┘"
 echo ""
-echo "The node-exporter service should automatically start on this node"
-echo "(it runs in 'global' mode on all swarm nodes)."
+echo "Features enabled:"
+echo "  ✓ Shelf mode (never sleeps, lid close ignored)"
+echo "  ✓ mDNS discovery (reachable as ${NEW_HOSTNAME}.local)"
+echo "  ✓ Auto-recovery (self-healing after reboot/IP change)"
 echo ""
-echo "Check with: docker service ps node-exporter"
+echo "Auto-Recovery:"
+echo "  The cluster will automatically heal after reboots or IP changes."
+echo "  Nodes discover each other via mDNS and the lowest alphabetical"
+echo "  hostname becomes the recovery leader if needed."
 echo ""
-echo "Next steps:"
-echo "  1. Set up SSH key access (see Step 6 above)"
-echo "  2. Add more nodes by running setup.sh on them"
-echo "  3. Verify in the NodeNook dashboard"
+echo "  View logs:        cat $NODENOOK_DIR/logs/recovery.log"
+echo "  Manual recovery:  sudo systemctl restart nodenook-recovery"
 echo ""
-echo "To see all nodes: docker node ls"
+echo "Useful commands:"
+echo "  docker node ls                      # List all swarm nodes"
+echo "  ping ${NEW_HOSTNAME}.local          # Test mDNS"
+echo "  systemctl status nodenook-recovery  # Check recovery service"
 echo ""
