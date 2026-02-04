@@ -37,13 +37,14 @@ header "NodeNook Setup"
 echo "This script will add this machine to an existing NodeNook cluster."
 echo ""
 echo "It will:"
-echo "  1. Install Docker (if not present)"
-echo "  2. Install Avahi for mDNS discovery (hostname.local)"
-echo "  3. Set the hostname"
-echo "  4. Join the Docker Swarm as a manager"
-echo "  5. Set up SSH access for the dashboard"
-echo "  6. Install auto-recovery service (self-healing after reboot/IP change)"
-echo "  7. Configure shelf mode (no sleep, lid close ignored)"
+echo "  1. Install prerequisites (curl, ca-certificates)"
+echo "  2. Install Docker (if not present)"
+echo "  3. Install Avahi for mDNS discovery (hostname.local)"
+echo "  4. Set the hostname"
+echo "  5. Join the Docker Swarm as a manager"
+echo "  6. Set up SSH access for the dashboard"
+echo "  7. Install auto-recovery service (self-healing after reboot/IP change)"
+echo "  8. Configure shelf mode (no sleep, lid close ignored)"
 echo ""
 echo "You'll need:"
 echo "  - The IP address of an existing swarm manager"
@@ -52,9 +53,27 @@ echo ""
 read -p "Press Enter to continue (or Ctrl+C to cancel)..." </dev/tty
 
 # ============================================================
-# Step 1: Check/Install Docker
+# Step 1: Install Prerequisites
 # ============================================================
-header "Step 1: Docker"
+header "Step 1: Prerequisites"
+
+log "Installing required packages..."
+
+if command -v apt-get &> /dev/null; then
+    sudo apt-get update -qq
+    sudo apt-get install -y curl ca-certificates
+elif command -v dnf &> /dev/null; then
+    sudo dnf install -y curl ca-certificates
+elif command -v yum &> /dev/null; then
+    sudo yum install -y curl ca-certificates
+fi
+
+success "Prerequisites installed"
+
+# ============================================================
+# Step 1b: Check/Install Docker
+# ============================================================
+header "Step 1b: Docker"
 
 if command -v docker &> /dev/null; then
     log "Docker is already installed: $(docker --version)"
